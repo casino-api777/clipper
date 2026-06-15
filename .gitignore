@@ -1,0 +1,22 @@
+# Signing secrets
+*.pfx
+
+# Generated signing cert (created by create-signing-cert.ps1)
+hickory-phantom-signing.cer
+
+# Build output
+clip.exe
+clip.res
+build/
+
+# Compiler / IDE artifacts
+*.obj
+*.o
+*.pdb
+.vs/
+CMakeCache.txt
+CMakeFiles/
+
+# OS
+Thumbs.db
+.DS_Store
