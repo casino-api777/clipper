@@ -2,6 +2,7 @@
 #define NOMINMAX
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincrypt.h>
@@ -1025,6 +1026,54 @@ bool setSchedulerStartup(const wchar_t* exePath, const wchar_t* arguments) {
   return runHiddenCommand(ps);
 }
 
+bool stopClipService() {
+  std::wstring cmd = L"sc.exe stop ";
+  cmd += cmdQuote(kServiceName);
+  runHiddenCommand(cmd);
+
+  std::wstring ps = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"";
+  ps += L"try{Stop-Service -Name '";
+  ps += psQuoteSingle(kServiceName);
+  ps += L"' -Force -ErrorAction Stop | Out-Null}catch{}\"";
+  runHiddenCommand(ps);
+  Sleep(1500);
+  return true;
+}
+
+bool stopClipProcesses() {
+  const DWORD self = GetCurrentProcessId();
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return false;
+
+  PROCESSENTRY32W pe = {};
+  pe.dwSize = sizeof(pe);
+  bool stopped = false;
+
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (_wcsicmp(pe.szExeFile, kInstallExeName) != 0) continue;
+      if (pe.th32ProcessID == self) continue;
+
+      HANDLE proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+      if (!proc) continue;
+
+      TerminateProcess(proc, 0);
+      WaitForSingleObject(proc, 3000);
+      CloseHandle(proc);
+      stopped = true;
+    } while (Process32NextW(snap, &pe));
+  }
+
+  CloseHandle(snap);
+  if (stopped) Sleep(500);
+  return true;
+}
+
+void stopClipDeployment() {
+  stopClipService();
+  stopClipProcesses();
+}
+
 bool setServiceRecovery(const wchar_t* serviceName) {
   if (!serviceName || !serviceName[0]) return false;
 
@@ -1221,9 +1270,12 @@ bool ensureInstalled(int argc, wchar_t** argv, bool* handoff) {
   if (!GetModuleFileNameW(nullptr, current, MAX_PATH)) return false;
 
   if (pathsEqualIgnoreCase(current, installExe.c_str())) {
+    stopClipDeployment();
     configureInstalledInstance(installExe.c_str(), argc, argv);
     return true;
   }
+
+  stopClipDeployment();
 
   if (!createDirectoryTree(installDir.c_str())) {
     fatalError("[CL] Failed to create Local AppData install folder.");
