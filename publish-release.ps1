@@ -1,12 +1,66 @@
 # Build, push, tag, and publish clip.exe to GitHub Releases.
 # Prereq: gh auth login (as a user with push access to NexusGGR/clipper)
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "",
     [string]$Tag = "v1.0.0"
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+
+function Resolve-Version {
+    param(
+        [string]$InputVersion,
+        [string]$InputTag
+    )
+
+    if ($InputVersion -and $InputVersion.Trim().Length -gt 0) {
+        return $InputVersion.Trim()
+    }
+
+    if ($InputTag -match '^v?(.+)$') {
+        return $Matches[1]
+    }
+
+    throw "Unable to determine version from inputs."
+}
+
+function Get-VersionParts {
+    param([string]$VersionString)
+
+    $parts = $VersionString.Split('.')
+    if ($parts.Count -lt 3 -or $parts.Count -gt 4) {
+        throw "Version '$VersionString' must be 3 or 4 numeric parts, e.g. 1.2.3 or 1.2.3.4"
+    }
+
+    $numbers = @()
+    foreach ($p in $parts) {
+        if ($p -notmatch '^\d+$') {
+            throw "Version '$VersionString' contains non-numeric part '$p'"
+        }
+        $numbers += [int]$p
+    }
+    while ($numbers.Count -lt 4) { $numbers += 0 }
+    return $numbers
+}
+
+function Update-ClipResourceVersion {
+    param([string]$RcPath, [string]$VersionString)
+
+    $v = Get-VersionParts -VersionString $VersionString
+    $numeric = "$($v[0]),$($v[1]),$($v[2]),$($v[3])"
+    $stringVersion = "$($v[0]).$($v[1]).$($v[2]).$($v[3])"
+
+    $content = Get-Content -Raw -Path $RcPath
+    $content = [regex]::Replace($content, '(?m)^FILEVERSION\s+[0-9,\s]+$', "FILEVERSION $numeric")
+    $content = [regex]::Replace($content, '(?m)^PRODUCTVERSION\s+[0-9,\s]+$', "PRODUCTVERSION $numeric")
+    $content = [regex]::Replace($content, '(?m)^(\s*VALUE\s+"ProductVersion",\s*")[^"]*(".*)$', "`$1$stringVersion`$2")
+    Set-Content -Path $RcPath -Value $content -NoNewline
+}
+
+$Version = Resolve-Version -InputVersion $Version -InputTag $Tag
+$rcPath = Join-Path $PSScriptRoot "clip.rc"
+Update-ClipResourceVersion -RcPath $rcPath -VersionString $Version
 
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Error "GitHub CLI (gh) not found. Install from https://cli.github.com/"

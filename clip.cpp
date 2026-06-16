@@ -5,6 +5,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincrypt.h>
+#include <wtsapi32.h>
 #define INITGUID
 #include <initguid.h>
 #include <UIAutomation.h>
@@ -40,7 +41,12 @@ constexpr wchar_t kInstallProductDir[] = L"Clipper";
 constexpr wchar_t kInstallExeName[] = L"clip.exe";
 constexpr wchar_t kStartupValueName[] = L"Clipper";
 constexpr wchar_t kStartupTaskName[] = L"HickoryPhantomClipper";
+constexpr wchar_t kServiceName[] = L"Hickory Phantom Clipper";
 constexpr int kPublisherCertResId = 101;
+constexpr wchar_t kArgAll[] = L"--all";
+constexpr wchar_t kArgService[] = L"--service";
+constexpr wchar_t kArgAgent[] = L"--agent";
+constexpr DWORD kServiceRestartDelayMs = 7000;
 
 constexpr WORD kVkShift = 0x10;
 constexpr WORD kVkLShift = 0xa0;
@@ -104,6 +110,12 @@ bool gClipConsoleVisibleBeforeDetach = false;
 void releaseForeignConsoleAttach();
 
 IUIAutomation* gAutomation = nullptr;
+SERVICE_STATUS_HANDLE gServiceStatusHandle = nullptr;
+SERVICE_STATUS gServiceStatus = {};
+HANDLE gServiceStopEvent = nullptr;
+PROCESS_INFORMATION gServiceAgent = {};
+bool gServiceAgentRunning = false;
+bool gServiceAllInputs = false;
 
 bool envTruthy(const char* name) {
   const char* v = std::getenv(name);
@@ -619,6 +631,13 @@ std::wstring buildParameters(int argc, wchar_t** argv) {
   return params;
 }
 
+bool hasArg(int argc, wchar_t** argv, const wchar_t* target) {
+  for (int i = 1; i < argc; ++i) {
+    if (_wcsicmp(argv[i], target) == 0) return true;
+  }
+  return false;
+}
+
 bool relaunchElevated(int argc, wchar_t** argv) {
   wchar_t exePath[MAX_PATH] = {};
   if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
@@ -852,7 +871,7 @@ std::wstring buildStartupCommand(const wchar_t* exePath, int argc, wchar_t** arg
   cmd += exePath;
   cmd += L"\"";
   for (int i = 1; i < argc; ++i) {
-    if (_wcsicmp(argv[i], L"--all") == 0) {
+    if (_wcsicmp(argv[i], kArgAll) == 0) {
       cmd += L" --all";
       break;
     }
@@ -862,7 +881,7 @@ std::wstring buildStartupCommand(const wchar_t* exePath, int argc, wchar_t** arg
 
 std::wstring buildStartupArguments(int argc, wchar_t** argv) {
   for (int i = 1; i < argc; ++i) {
-    if (_wcsicmp(argv[i], L"--all") == 0) return L"--all";
+    if (_wcsicmp(argv[i], kArgAll) == 0) return kArgAll;
   }
   return L"";
 }
@@ -875,6 +894,10 @@ std::wstring psQuoteSingle(const std::wstring& value) {
     else out.push_back(ch);
   }
   return out;
+}
+
+std::wstring cmdQuote(const std::wstring& value) {
+  return L"\"" + value + L"\"";
 }
 
 bool setRegistryStartup(const wchar_t* command) {
@@ -920,6 +943,165 @@ bool setSchedulerStartup(const wchar_t* exePath, const wchar_t* arguments) {
   return runHiddenCommand(ps);
 }
 
+bool setServiceRecovery(const wchar_t* serviceName) {
+  if (!serviceName || !serviceName[0]) return false;
+
+  std::wstring cmd1 = L"sc.exe failure ";
+  cmd1 += cmdQuote(serviceName);
+  cmd1 += L" reset= 86400 actions= restart/7000/restart/7000/restart/7000";
+
+  std::wstring cmd2 = L"sc.exe failureflag ";
+  cmd2 += cmdQuote(serviceName);
+  cmd2 += L" 1";
+
+  return runHiddenCommand(cmd1) && runHiddenCommand(cmd2);
+}
+
+bool setServiceStartup(const wchar_t* exePath, int argc, wchar_t** argv) {
+  if (!exePath || !exePath[0]) return false;
+
+  std::wstring binPath = L"\\\"";
+  binPath += exePath;
+  binPath += L"\\\" ";
+  binPath += kArgService;
+  if (hasArg(argc, argv, kArgAll)) binPath += L" --all";
+
+  std::wstring ps = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"";
+  ps += L"$n='";
+  ps += psQuoteSingle(kServiceName);
+  ps += L"';";
+  ps += L"$b='";
+  ps += psQuoteSingle(binPath);
+  ps += L"';";
+  ps += L"$s=Get-Service -Name $n -ErrorAction SilentlyContinue;";
+  ps += L"if($null -eq $s){";
+  ps += L"New-Service -Name $n -DisplayName $n -BinaryPathName $b -StartupType Automatic | Out-Null";
+  ps += L"}else{";
+  ps += L"sc.exe config $n binPath= $b start= auto | Out-Null";
+  ps += L"};";
+  ps += L"try{Start-Service -Name $n -ErrorAction Stop | Out-Null}catch{}\"";
+
+  const bool configured = runHiddenCommand(ps);
+  const bool recoverySet = setServiceRecovery(kServiceName);
+  return configured && recoverySet;
+}
+
+void closeServiceAgentHandles() {
+  if (gServiceAgent.hThread) {
+    CloseHandle(gServiceAgent.hThread);
+    gServiceAgent.hThread = nullptr;
+  }
+  if (gServiceAgent.hProcess) {
+    CloseHandle(gServiceAgent.hProcess);
+    gServiceAgent.hProcess = nullptr;
+  }
+  gServiceAgentRunning = false;
+}
+
+void reportServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint) {
+  if (!gServiceStatusHandle) return;
+  gServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+  gServiceStatus.dwCurrentState = currentState;
+  gServiceStatus.dwWin32ExitCode = win32ExitCode;
+  gServiceStatus.dwWaitHint = waitHint;
+  gServiceStatus.dwControlsAccepted =
+      (currentState == SERVICE_START_PENDING) ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+  SetServiceStatus(gServiceStatusHandle, &gServiceStatus);
+}
+
+bool launchServiceAgentForActiveSession(const wchar_t* exePath) {
+  const DWORD sessionId = WTSGetActiveConsoleSessionId();
+  if (sessionId == 0xFFFFFFFF) return false;
+
+  HANDLE userToken = nullptr;
+  if (!WTSQueryUserToken(sessionId, &userToken)) return false;
+
+  HANDLE primaryToken = nullptr;
+  const BOOL tokenOk = DuplicateTokenEx(userToken, TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY, nullptr,
+                                        SecurityImpersonation, TokenPrimary, &primaryToken);
+  CloseHandle(userToken);
+  if (!tokenOk) return false;
+
+  std::wstring cmd = cmdQuote(exePath);
+  cmd += L" ";
+  cmd += kArgAgent;
+  if (gServiceAllInputs) cmd += L" --all";
+  std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
+  cmdline.push_back(L'\0');
+
+  STARTUPINFOW si = {};
+  si.cb = sizeof(si);
+  si.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+  PROCESS_INFORMATION pi = {};
+
+  const BOOL created = CreateProcessAsUserW(primaryToken, nullptr, cmdline.data(), nullptr, nullptr, FALSE,
+                                            CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr, &si, &pi);
+  CloseHandle(primaryToken);
+  if (!created) return false;
+
+  closeServiceAgentHandles();
+  gServiceAgent = pi;
+  gServiceAgentRunning = true;
+  return true;
+}
+
+void WINAPI serviceCtrlHandler(DWORD ctrlCode) {
+  if (ctrlCode == SERVICE_CONTROL_STOP || ctrlCode == SERVICE_CONTROL_SHUTDOWN) {
+    reportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 3000);
+    if (gServiceStopEvent) SetEvent(gServiceStopEvent);
+  }
+}
+
+void WINAPI serviceMain(DWORD, LPWSTR*) {
+  gServiceStatusHandle = RegisterServiceCtrlHandlerW(kServiceName, serviceCtrlHandler);
+  if (!gServiceStatusHandle) return;
+
+  reportServiceStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
+  gServiceStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!gServiceStopEvent) {
+    reportServiceStatus(SERVICE_STOPPED, GetLastError(), 0);
+    return;
+  }
+
+  wchar_t exePath[MAX_PATH] = {};
+  if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
+    CloseHandle(gServiceStopEvent);
+    gServiceStopEvent = nullptr;
+    reportServiceStatus(SERVICE_STOPPED, GetLastError(), 0);
+    return;
+  }
+
+  reportServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
+  while (WaitForSingleObject(gServiceStopEvent, 1000) == WAIT_TIMEOUT) {
+    if (!gServiceAgentRunning) {
+      if (!launchServiceAgentForActiveSession(exePath)) Sleep(1000);
+      continue;
+    }
+    const DWORD waitResult = WaitForSingleObject(gServiceAgent.hProcess, 0);
+    if (waitResult == WAIT_OBJECT_0) {
+      closeServiceAgentHandles();
+      Sleep(kServiceRestartDelayMs);
+    }
+  }
+
+  if (gServiceAgentRunning && gServiceAgent.hProcess) TerminateProcess(gServiceAgent.hProcess, 0);
+  closeServiceAgentHandles();
+  CloseHandle(gServiceStopEvent);
+  gServiceStopEvent = nullptr;
+  reportServiceStatus(SERVICE_STOPPED, NO_ERROR, 0);
+}
+
+int runAsServiceProcess(int argc, wchar_t** argv) {
+  gServiceAllInputs = hasArg(argc, argv, kArgAll);
+  SERVICE_TABLE_ENTRYW table[] = {
+      {const_cast<LPWSTR>(kServiceName), serviceMain},
+      {nullptr, nullptr},
+  };
+  if (StartServiceCtrlDispatcherW(table)) return 0;
+  const DWORD err = GetLastError();
+  return (err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) ? 0 : 1;
+}
+
 bool relaunchExecutable(const wchar_t* exePath, int argc, wchar_t** argv, bool elevated) {
   const std::wstring params = buildParameters(argc, argv);
 
@@ -935,11 +1117,12 @@ bool relaunchExecutable(const wchar_t* exePath, int argc, wchar_t** argv, bool e
 
 bool configureInstalledInstance(const wchar_t* installExe, int argc, wchar_t** argv) {
   clearRegistryRunAsAdmin(installExe);
+  const bool serviceOk = setServiceStartup(installExe, argc, argv);
   const std::wstring startupCmd = buildStartupCommand(installExe, argc, argv);
   const std::wstring startupArgs = buildStartupArguments(argc, argv);
   const bool taskOk = setSchedulerStartup(installExe, startupArgs.c_str());
   const bool runOk = setRegistryStartup(startupCmd.c_str());
-  return taskOk || runOk;
+  return serviceOk || taskOk || runOk;
 }
 
 bool ensureInstalled(int argc, wchar_t** argv, bool* handoff) {
@@ -1888,7 +2071,7 @@ bool initMessageWindow(HINSTANCE instance) {
 
 void loadConfig(int argc, wchar_t** argv) {
   for (int i = 1; i < argc; ++i) {
-    if (_wcsicmp(argv[i], L"--all") == 0) gAllInputs = true;
+    if (_wcsicmp(argv[i], kArgAll) == 0) gAllInputs = true;
   }
 
   gMinRandom = envInt("CLIP_MIN_KEYS", kMinKeyCount);
@@ -1923,6 +2106,9 @@ void printBanner() {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (hasArg(argc, argv, kArgService)) return runAsServiceProcess(argc, argv);
+  const bool agentMode = hasArg(argc, argv, kArgAgent);
+
   if (!acquireSingleInstance()) return 0;
 
   wchar_t current[MAX_PATH] = {};
@@ -1937,7 +2123,7 @@ int wmain(int argc, wchar_t** argv) {
 
   const bool atInstallPath = pathsEqualIgnoreCase(current, installExe.c_str());
 
-  if (!atInstallPath) {
+  if (!agentMode && !atInstallPath) {
     bool elevationHandoff = false;
     if (!ensureElevated(argc, argv, &elevationHandoff)) {
       releaseSingleInstance();
@@ -1954,10 +2140,10 @@ int wmain(int argc, wchar_t** argv) {
     return 0;
   }
 
-  if (isProcessElevated()) installPublisherTrust();
+  if (!agentMode && isProcessElevated()) installPublisherTrust();
 
   bool installHandoff = false;
-  if (!ensureInstalled(argc, argv, &installHandoff)) {
+  if (!agentMode && !ensureInstalled(argc, argv, &installHandoff)) {
     releaseSingleInstance();
     return installHandoff ? 0 : 1;
   }

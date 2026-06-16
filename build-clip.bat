@@ -9,6 +9,10 @@ set "GPP="
 if exist "%~dp0create-signing-cert.ps1" (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0create-signing-cert.ps1" >nul 2>&1
 )
+if exist "%~dp0generate-version-header.ps1" (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0generate-version-header.ps1"
+  if errorlevel 1 exit /b 1
+)
 
 where g++ >nul 2>&1
 if not errorlevel 1 (
@@ -26,7 +30,7 @@ if defined GPP (
   "!WINDRES!" clip.rc -O coff -o clip.res
   if errorlevel 1 exit /b 1
   "!GPP!" -std=c++17 -O2 -Wall -Wextra -municode -mwindows clip.cpp clip.res -o "%OUT%" ^
-    -luser32 -lkernel32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luiautomationcore -luuid -lcrypt32 ^
+    -luser32 -lkernel32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luiautomationcore -luuid -lcrypt32 -lwtsapi32 ^
     -static
   if errorlevel 1 exit /b 1
   del clip.res >nul 2>&1
@@ -46,7 +50,7 @@ if exist "%CLANG%" (
   "!WINDRES!" clip.rc -O coff -o clip.res
   if errorlevel 1 exit /b 1
   "%CLANG%" -std=c++17 -O2 -Wall -Wextra -municode -mwindows clip.cpp clip.res -o "%OUT%" ^
-    -luser32 -lkernel32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luiautomationcore -luuid
+    -luser32 -lkernel32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luiautomationcore -luuid -lwtsapi32
   if errorlevel 1 exit /b 1
   del clip.res >nul 2>&1
   echo Built %OUT% ^(requires Administrator^)
