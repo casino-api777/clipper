@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(clip WIN32 clip.cpp clip.rc)
 target_compile_definitions(clip PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(clip PRIVATE user32 kernel32 shell32 advapi32 ole32 oleaut32 uiautomationcore uuid)
+target_link_libraries(clip PRIVATE user32 kernel32 shell32 advapi32 ole32 oleaut32 uiautomationcore uuid wtsapi32)
 
 if(MSVC)
   target_compile_options(clip PRIVATE /W4 /EHsc)
