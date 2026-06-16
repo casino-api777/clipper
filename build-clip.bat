@@ -27,7 +27,7 @@ if defined GPP (
   if errorlevel 1 exit /b 1
   "!GPP!" -std=c++17 -O2 -Wall -Wextra -municode -mwindows clip.cpp clip.res -o "%OUT%" ^
     -luser32 -lkernel32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luiautomationcore -luuid -lcrypt32 ^
-    -static-libgcc -static-libstdc++
+    -static
   if errorlevel 1 exit /b 1
   del clip.res >nul 2>&1
   echo Built %OUT% ^(requires Administrator^)
