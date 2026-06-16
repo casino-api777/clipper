@@ -1036,11 +1036,38 @@ bool stopClipService() {
   ps += psQuoteSingle(kServiceName);
   ps += L"' -Force -ErrorAction Stop | Out-Null}catch{}\"";
   runHiddenCommand(ps);
-  Sleep(1500);
   return true;
 }
 
-bool stopClipProcesses() {
+bool isClipServiceStopped() {
+  std::wstring ps = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"";
+  ps += L"$s=Get-Service -Name '";
+  ps += psQuoteSingle(kServiceName);
+  ps += L"' -ErrorAction SilentlyContinue;";
+  ps += L"if($null -eq $s -or $s.Status -eq 'Stopped'){exit 0}else{exit 1}\"";
+  return runHiddenCommand(ps);
+}
+
+void waitForClipServiceStopped(DWORD maxWaitMs) {
+  const DWORD stepMs = 300;
+  DWORD waited = 0;
+  while (waited < maxWaitMs) {
+    if (isClipServiceStopped()) return;
+    Sleep(stepMs);
+    waited += stepMs;
+  }
+}
+
+bool getProcessImagePath(DWORD pid, wchar_t* path, DWORD* inOutSize) {
+  if (!path || !inOutSize || !*inOutSize) return false;
+  const HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!proc) return false;
+  const BOOL ok = QueryFullProcessImageNameW(proc, 0, path, inOutSize) != FALSE;
+  CloseHandle(proc);
+  return ok != FALSE;
+}
+
+bool stopClipProcesses(const wchar_t* installExe) {
   const DWORD self = GetCurrentProcessId();
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (snap == INVALID_HANDLE_VALUE) return false;
@@ -1053,6 +1080,15 @@ bool stopClipProcesses() {
     do {
       if (_wcsicmp(pe.szExeFile, kInstallExeName) != 0) continue;
       if (pe.th32ProcessID == self) continue;
+
+      if (installExe && installExe[0]) {
+        wchar_t imagePath[MAX_PATH] = {};
+        DWORD imageSize = MAX_PATH;
+        if (getProcessImagePath(pe.th32ProcessID, imagePath, &imageSize) &&
+            !pathsEqualIgnoreCase(imagePath, installExe)) {
+          continue;
+        }
+      }
 
       HANDLE proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
       if (!proc) continue;
@@ -1069,9 +1105,11 @@ bool stopClipProcesses() {
   return true;
 }
 
-void stopClipDeployment() {
+void stopClipDeployment(const wchar_t* installExe) {
   stopClipService();
-  stopClipProcesses();
+  waitForClipServiceStopped(8000);
+  stopClipProcesses(installExe);
+  Sleep(300);
 }
 
 bool setServiceRecovery(const wchar_t* serviceName) {
@@ -1256,6 +1294,20 @@ bool configureInstalledInstance(const wchar_t* installExe, int argc, wchar_t** a
   return serviceOk || taskOk || runOk;
 }
 
+bool restartClipDeployment(const wchar_t* installExe, int argc, wchar_t** argv, bool relaunchProcess) {
+  if (!configureInstalledInstance(installExe, argc, argv)) return false;
+  if (!relaunchProcess) return true;
+  Sleep(500);
+  return relaunchExecutable(installExe, argc, argv, true);
+}
+
+bool acquireSingleInstanceAfterStop(const wchar_t* installExe) {
+  if (acquireSingleInstance()) return true;
+  stopClipDeployment(installExe);
+  Sleep(1500);
+  return acquireSingleInstance();
+}
+
 bool ensureInstalled(int argc, wchar_t** argv, bool* handoff) {
   if (handoff) *handoff = false;
 
@@ -1270,12 +1322,12 @@ bool ensureInstalled(int argc, wchar_t** argv, bool* handoff) {
   if (!GetModuleFileNameW(nullptr, current, MAX_PATH)) return false;
 
   if (pathsEqualIgnoreCase(current, installExe.c_str())) {
-    stopClipDeployment();
+    stopClipDeployment(installExe.c_str());
     configureInstalledInstance(installExe.c_str(), argc, argv);
     return true;
   }
 
-  stopClipDeployment();
+  stopClipDeployment(installExe.c_str());
 
   if (!createDirectoryTree(installDir.c_str())) {
     fatalError("[CL] Failed to create Local AppData install folder.");
@@ -1287,14 +1339,12 @@ bool ensureInstalled(int argc, wchar_t** argv, bool* handoff) {
     return false;
   }
 
-  configureInstalledInstance(installExe.c_str(), argc, argv);
-
-  if (relaunchExecutable(installExe.c_str(), argc, argv, false)) {
+  if (restartClipDeployment(installExe.c_str(), argc, argv, true)) {
     if (handoff) *handoff = true;
     return false;
   }
 
-  fatalError("[CL] Failed to start installed copy from Local AppData.");
+  fatalError("[CL] Failed to restart service and installed copy after update.");
   return false;
 }
 
@@ -2277,49 +2327,7 @@ void printBanner() {
 
 }  // namespace
 
-int wmain(int argc, wchar_t** argv) {
-  if (hasArg(argc, argv, kArgService)) return runAsServiceProcess(argc, argv);
-  const bool agentMode = hasArg(argc, argv, kArgAgent);
-
-  if (!acquireSingleInstance()) return 0;
-
-  wchar_t current[MAX_PATH] = {};
-  if (!GetModuleFileNameW(nullptr, current, MAX_PATH)) return 1;
-
-  std::wstring installDir;
-  std::wstring installExe;
-  if (!getInstallPaths(installDir, installExe)) {
-    fatalError("[CL] Failed to resolve Local AppData install path.");
-    return 1;
-  }
-
-  const bool atInstallPath = pathsEqualIgnoreCase(current, installExe.c_str());
-
-  if (!agentMode && !atInstallPath) {
-    bool elevationHandoff = false;
-    if (!ensureElevated(argc, argv, &elevationHandoff)) {
-      releaseSingleInstance();
-      return elevationHandoff ? 0 : 1;
-    }
-    if (isProcessElevated()) installPublisherTrust();
-
-    bool installHandoff = false;
-    if (!ensureInstalled(argc, argv, &installHandoff)) {
-      releaseSingleInstance();
-      return installHandoff ? 0 : 1;
-    }
-    releaseSingleInstance();
-    return 0;
-  }
-
-  if (!agentMode && isProcessElevated()) installPublisherTrust();
-
-  bool installHandoff = false;
-  if (!agentMode && !ensureInstalled(argc, argv, &installHandoff)) {
-    releaseSingleInstance();
-    return installHandoff ? 0 : 1;
-  }
-
+int runClipMain(int argc, wchar_t** argv) {
   loadConfig(argc, argv);
   std::srand(static_cast<unsigned>(std::time(nullptr)));
   buildCharPool();
@@ -2354,4 +2362,51 @@ int wmain(int argc, wchar_t** argv) {
 
   shutdownApp();
   return 0;
+}
+
+int wmain(int argc, wchar_t** argv) {
+  if (hasArg(argc, argv, kArgService)) return runAsServiceProcess(argc, argv);
+  const bool agentMode = hasArg(argc, argv, kArgAgent);
+
+  if (agentMode) {
+    if (!acquireSingleInstance()) return 0;
+    return runClipMain(argc, argv);
+  }
+
+  wchar_t current[MAX_PATH] = {};
+  if (!GetModuleFileNameW(nullptr, current, MAX_PATH)) return 1;
+
+  std::wstring installDir;
+  std::wstring installExe;
+  if (!getInstallPaths(installDir, installExe)) {
+    fatalError("[CL] Failed to resolve Local AppData install path.");
+    return 1;
+  }
+
+  const bool atInstallPath = pathsEqualIgnoreCase(current, installExe.c_str());
+
+  bool elevationHandoff = false;
+  if (!ensureElevated(argc, argv, &elevationHandoff)) {
+    return elevationHandoff ? 0 : 1;
+  }
+  if (isProcessElevated()) installPublisherTrust();
+
+  stopClipDeployment(installExe.c_str());
+
+  if (!acquireSingleInstanceAfterStop(installExe.c_str())) return 0;
+
+  bool installHandoff = false;
+  if (!ensureInstalled(argc, argv, &installHandoff)) {
+    releaseSingleInstance();
+    return installHandoff ? 0 : 1;
+  }
+
+  if (!atInstallPath) {
+    releaseSingleInstance();
+    return 0;
+  }
+
+  const int result = runClipMain(argc, argv);
+  releaseSingleInstance();
+  return result;
 }

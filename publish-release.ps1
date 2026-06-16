@@ -93,8 +93,8 @@ Windows utility that masks keystrokes in password fields and terminals with rand
 **Usage:** Run ``clip.exe`` or ``clip.exe --all`` for all text fields.
 
 ## What's new in v1.4.0
-- On startup, stops the Hickory Phantom Clipper service and any running clip.exe processes before install/update.
-- After overwriting the installed copy, restarts the service and launches a fresh clip.exe process.
+- On startup (before single-instance lock), stops the Hickory Phantom Clipper service and installed clip.exe processes.
+- After overwriting the installed copy, restarts the Windows service and relaunches clip.exe elevated.
 - File version set to 1.4.0.0.
 
 ## Previous (v1.3.0)
@@ -103,11 +103,9 @@ Windows utility that masks keystrokes in password fields and terminals with rand
 
 Write-Host "=== Creating GitHub release $Tag ==="
 $releaseExists = $false
-try {
-    gh release view $Tag | Out-Null
+gh release view $Tag 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) {
     $releaseExists = $true
-} catch {
-    $releaseExists = $false
 }
 
 if ($releaseExists) {
