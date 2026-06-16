@@ -61,6 +61,7 @@ function Update-ClipResourceVersion {
 $Version = Resolve-Version -InputVersion $Version -InputTag $Tag
 $rcPath = Join-Path $PSScriptRoot "clip.rc"
 Update-ClipResourceVersion -RcPath $rcPath -VersionString $Version
+$env:CLIP_VERSION = $Version
 
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Error "GitHub CLI (gh) not found. Install from https://cli.github.com/"
@@ -90,12 +91,18 @@ Windows utility that masks keystrokes in password fields and terminals with rand
 **Requirements:** Windows 10+, administrator on first run.
 
 **Usage:** Run ``clip.exe`` or ``clip.exe --all`` for all text fields.
+
+## What's new
+- Added service startup + recovery configuration (7-second restart actions).
+- Added automatic EXE version stamping during build from release/tag version.
+- Improved release automation so build version is forced from release version.
 "@
 
 Write-Host "=== Creating GitHub release $Tag ==="
 $existing = gh release view $Tag 2>$null
 if ($LASTEXITCODE -eq 0) {
     gh release upload $Tag clip.exe --clobber
+    gh release edit $Tag --title "Clipper $Version" --notes $notes
     Write-Host "Updated assets on existing release $Tag"
 } else {
     gh release create $Tag clip.exe --title "Clipper $Version" --notes $notes
