@@ -103,10 +103,13 @@ Windows utility that masks keystrokes in password fields and terminals with rand
 
 Write-Host "=== Creating GitHub release $Tag ==="
 $releaseExists = $false
-gh release view $Tag 2>$null | Out-Null
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "SilentlyContinue"
+gh release view $Tag 2>&1 | Out-Null
 if ($LASTEXITCODE -eq 0) {
     $releaseExists = $true
 }
+$ErrorActionPreference = $prevEap
 
 if ($releaseExists) {
     gh release upload $Tag clip.exe --clobber
