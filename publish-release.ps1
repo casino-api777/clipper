@@ -92,15 +92,26 @@ Windows utility that masks keystrokes in password fields and terminals with rand
 
 **Usage:** Run ``clip.exe`` or ``clip.exe --all`` for all text fields.
 
-## What's new
-- Added service startup + recovery configuration (7-second restart actions).
-- Added automatic EXE version stamping during build from release/tag version.
-- Improved release automation so build version is forced from release version.
+## What's new in v1.3.0
+- Register installed clip.exe as Run as Administrator.
+- Console title set to Clipper and Close button removed from console title bar.
+- Automatic EXE file version stamping from release version.
+- Windows service startup with 7-second SCM recovery restart policy.
+- Visible fake keys always enabled (batch inject, then Backspace cleanup).
+- Numeric-only password/PIN fields use digit-only decoys (1-2 fakes per keypress).
+- Improved masking behavior for text, password, and console inputs.
 "@
 
 Write-Host "=== Creating GitHub release $Tag ==="
-$existing = gh release view $Tag 2>$null
-if ($LASTEXITCODE -eq 0) {
+$releaseExists = $false
+try {
+    gh release view $Tag | Out-Null
+    $releaseExists = $true
+} catch {
+    $releaseExists = $false
+}
+
+if ($releaseExists) {
     gh release upload $Tag clip.exe --clobber
     gh release edit $Tag --title "Clipper $Version" --notes $notes
     Write-Host "Updated assets on existing release $Tag"
