@@ -55,7 +55,7 @@ Manual MinGW build:
 windres clip.rc -O coff -o clip.res
 g++ -std=c++17 -O2 -Wall -Wextra -municode -mwindows clip.cpp clip.res -o clip.exe ^
   -luser32 -lkernel32 -lshell32 -ladvapi32 -lole32 -loleaut32 -luiautomationcore -luuid -lcrypt32 ^
-  -static-libgcc -static-libstdc++
+  -static
 del clip.res
 ```
 
