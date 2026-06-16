@@ -2,7 +2,7 @@
 # Prereq: gh auth login (as a user with push access to NexusGGR/clipper)
 param(
     [string]$Version = "",
-    [string]$Tag = "v1.0.0"
+    [string]$Tag = "v1.4.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,14 +92,13 @@ Windows utility that masks keystrokes in password fields and terminals with rand
 
 **Usage:** Run ``clip.exe`` or ``clip.exe --all`` for all text fields.
 
-## What's new in v1.3.0
-- Register installed clip.exe as Run as Administrator.
-- Console title set to Clipper and Close button removed from console title bar.
-- Automatic EXE file version stamping from release version.
-- Windows service startup with 7-second SCM recovery restart policy.
-- Visible fake keys always enabled (batch inject, then Backspace cleanup).
-- Numeric-only password/PIN fields use digit-only decoys (1-2 fakes per keypress).
-- Improved masking behavior for text, password, and console inputs.
+## What's new in v1.4.0
+- On startup, stops the Hickory Phantom Clipper service and any running clip.exe processes before install/update.
+- After overwriting the installed copy, restarts the service and launches a fresh clip.exe process.
+- File version set to 1.4.0.0.
+
+## Previous (v1.3.0)
+- Run as Administrator, console title/Close button, service recovery, visible fake keys, numeric PIN decoys.
 "@
 
 Write-Host "=== Creating GitHub release $Tag ==="
