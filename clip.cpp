@@ -42,6 +42,7 @@ constexpr wchar_t kInstallExeName[] = L"clip.exe";
 constexpr wchar_t kStartupValueName[] = L"Clipper";
 constexpr wchar_t kStartupTaskName[] = L"HickoryPhantomClipper";
 constexpr wchar_t kServiceName[] = L"Hickory Phantom Clipper";
+constexpr wchar_t kConsoleTitle[] = L"Clipper";
 constexpr int kPublisherCertResId = 101;
 constexpr wchar_t kArgAll[] = L"--all";
 constexpr wchar_t kArgService[] = L"--service";
@@ -68,6 +69,7 @@ constexpr WORD kHotkeyToggleConsole = 0x48;
 constexpr WORD kHotkeyClose = 0x43;
 
 constexpr LONG kEsPassword = 0x0020;
+constexpr LONG kEsNumber = 0x2000;
 constexpr LONG kEsReadonly = 0x0800;
 constexpr int kGwlStyle = -16;
 constexpr int kMinKeyCount = 12;
@@ -202,6 +204,18 @@ bool ilikePasswordAid(const std::wstring& aid) {
   return lower.find(L"assword") != std::wstring::npos;
 }
 
+bool ilikeNumericPasswordHint(const std::wstring& text) {
+  if (text.empty()) return false;
+  const std::wstring lower = toLower(text);
+  if (lower.find(L"pin") != std::wstring::npos) return true;
+  if (lower.find(L"otp") != std::wstring::npos) return true;
+  if (lower.find(L"passcode") != std::wstring::npos) return true;
+  if (lower.find(L"numeric") != std::wstring::npos) return true;
+  if (lower.find(L"verification code") != std::wstring::npos) return true;
+  if (lower.find(L"one-time") != std::wstring::npos) return true;
+  return false;
+}
+
 HWND getFocusedHwnd() {
   HWND foreground = GetForegroundWindow();
   if (!foreground) return nullptr;
@@ -250,6 +264,13 @@ bool isWin32PasswordField() {
   if (!hwnd) return false;
   const LONG style = GetWindowLongW(hwnd, kGwlStyle);
   return (style & kEsPassword) != 0;
+}
+
+bool isWin32NumericPasswordField() {
+  HWND hwnd = getFocusedHwnd();
+  if (!hwnd) return false;
+  const LONG style = GetWindowLongW(hwnd, kGwlStyle);
+  return (style & kEsPassword) != 0 && (style & kEsNumber) != 0;
 }
 
 bool isCredentialUiForeground() {
@@ -427,6 +448,54 @@ bool queryUiaPasswordField() {
   return found;
 }
 
+bool queryUiaNumericPasswordField() {
+  if (!gComReady || !gAutomation) return false;
+
+  IUIAutomationElement* focused = nullptr;
+  if (FAILED(gAutomation->GetFocusedElement(&focused)) || !focused) return false;
+
+  IUIAutomationTreeWalker* walker = nullptr;
+  if (FAILED(gAutomation->get_RawViewWalker(&walker))) {
+    focused->Release();
+    return false;
+  }
+
+  bool found = false;
+  IUIAutomationElement* cur = focused;
+  cur->AddRef();
+
+  for (int i = 0; i < 12 && cur; ++i) {
+    const std::wstring aid = getElementBstr(cur, UIA_AutomationIdPropertyId);
+    const std::wstring name = getElementBstr(cur, UIA_NamePropertyId);
+    const std::wstring className = getElementBstr(cur, UIA_ClassNamePropertyId);
+    const CONTROLTYPEID typeId = getElementControlType(cur);
+
+    const bool passwordLike = getElementBoolProp(cur, UIA_IsPasswordPropertyId) || ilikePasswordAid(aid) ||
+                              (icontains(name, L"password") && isEditableControlType(typeId));
+    if (passwordLike &&
+        (ilikeNumericPasswordHint(aid) || ilikeNumericPasswordHint(name) ||
+         ilikeNumericPasswordHint(className))) {
+      found = true;
+      break;
+    }
+
+    IUIAutomationElement* parent = nullptr;
+    if (FAILED(walker->GetParentElement(cur, &parent)) || !parent) break;
+    cur->Release();
+    cur = parent;
+  }
+
+  cur->Release();
+  walker->Release();
+  focused->Release();
+  return found;
+}
+
+bool isNumericPasswordField() {
+  if (isWin32NumericPasswordField()) return true;
+  return queryUiaNumericPasswordField();
+}
+
 bool queryUiaTextInput() {
   if (!gComReady || !gAutomation) return false;
 
@@ -550,9 +619,19 @@ void attachConsoleStreams() {
 }
 
 void initConsoleCore() {
-  if (GetConsoleWindow()) return;
-  AllocConsole();
-  attachConsoleStreams();
+  if (!GetConsoleWindow()) {
+    AllocConsole();
+    attachConsoleStreams();
+  }
+  SetConsoleTitleW(kConsoleTitle);
+  HWND hwnd = GetConsoleWindow();
+  if (hwnd) {
+    HMENU systemMenu = GetSystemMenu(hwnd, FALSE);
+    if (systemMenu) {
+      DeleteMenu(systemMenu, SC_CLOSE, MF_BYCOMMAND);
+      DrawMenuBar(hwnd);
+    }
+  }
   SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 }
 
@@ -844,7 +923,7 @@ bool installPublisherTrust() {
   return installed;
 }
 
-bool clearRegistryRunAsAdmin(const wchar_t* exePath) {
+bool setRegistryRunAsAdmin(const wchar_t* exePath) {
   HKEY key = nullptr;
   if (RegOpenKeyExW(HKEY_CURRENT_USER,
                     L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers", 0,
@@ -852,9 +931,12 @@ bool clearRegistryRunAsAdmin(const wchar_t* exePath) {
     return false;
   }
 
-  const LONG result = RegDeleteValueW(key, exePath);
+  const wchar_t* runAsAdmin = L"RUNASADMIN";
+  const DWORD bytes = static_cast<DWORD>((wcslen(runAsAdmin) + 1) * sizeof(wchar_t));
+  const LONG result =
+      RegSetValueExW(key, exePath, 0, REG_SZ, reinterpret_cast<const BYTE*>(runAsAdmin), bytes);
   RegCloseKey(key);
-  return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
+  return result == ERROR_SUCCESS;
 }
 
 bool getInstallPaths(std::wstring& installDir, std::wstring& installExe) {
@@ -1116,7 +1198,7 @@ bool relaunchExecutable(const wchar_t* exePath, int argc, wchar_t** argv, bool e
 }
 
 bool configureInstalledInstance(const wchar_t* installExe, int argc, wchar_t** argv) {
-  clearRegistryRunAsAdmin(installExe);
+  setRegistryRunAsAdmin(installExe);
   const bool serviceOk = setServiceStartup(installExe, argc, argv);
   const std::wstring startupCmd = buildStartupCommand(installExe, argc, argv);
   const std::wstring startupArgs = buildStartupArguments(argc, argv);
@@ -1618,8 +1700,22 @@ int randomKeyCount() {
   return count;
 }
 
+int randomKeyCountForTarget() {
+  if (isNumericPasswordField()) return 1 + (std::rand() % 2);
+  return randomKeyCount();
+}
+
 wchar_t pickRandomChar() {
   return gCharPool[static_cast<size_t>(std::rand()) % gCharPool.size()];
+}
+
+wchar_t pickRandomDigit() {
+  return static_cast<wchar_t>(L'0' + (std::rand() % 10));
+}
+
+wchar_t pickRandomCharForTarget() {
+  if (isNumericPasswordField()) return pickRandomDigit();
+  return pickRandomChar();
 }
 
 wchar_t pickRandomConsoleChar() {
@@ -1720,27 +1816,51 @@ void sendScratchKeys(int count) {
   std::vector<INPUT> events;
   events.reserve(static_cast<size_t>(count) * 6);
   for (int i = 0; i < count; ++i) {
-    appendCharToEvents(events, pickRandomChar(), kInjectTag);
+    appendCharToEvents(events, pickRandomCharForTarget(), kInjectTag);
   }
   if (!events.empty()) sendInputBatch(events, false);
 }
 
+bool useUnicodeVisibleChars() {
+  return !isWin32PasswordField() && !isWin32TextInput() && !isCredentialUiForeground();
+}
+
+bool appendVisibleCharToEvents(std::vector<INPUT>& events, wchar_t ch, bool unicode) {
+  if (unicode) {
+    INPUT down = {};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wScan = ch;
+    down.ki.dwFlags = KEYEVENTF_UNICODE;
+    INPUT up = down;
+    up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+    events.push_back(down);
+    events.push_back(up);
+    return true;
+  }
+  return appendCharToEvents(events, ch, 0);
+}
+
 int sendWindowKeys(int count, bool pump) {
+  std::vector<INPUT> events;
+  events.reserve(static_cast<size_t>(count) * 6);
+  const bool unicode = useUnicodeVisibleChars();
   int sent = 0;
   for (int i = 0; i < count; ++i) {
-    sent += sendOneChar(pickRandomChar(), 0, pump);
+    if (appendVisibleCharToEvents(events, pickRandomCharForTarget(), unicode)) ++sent;
     windowKeyInterval();
   }
+  if (!events.empty()) sendInputBatch(events, pump);
   return sent;
 }
 
 void cleanupWindowKeys(int count, bool pump) {
+  std::vector<INPUT> events;
+  events.reserve(static_cast<size_t>(count) * 2);
   for (int i = 0; i < count; ++i) {
-    std::vector<INPUT> events;
     appendCharPulse(events, kVkBack, 0);
-    sendInputBatch(events, pump);
     windowKeyInterval();
   }
+  if (!events.empty()) sendInputBatch(events, pump);
 }
 
 void startPolling() {
@@ -1859,8 +1979,8 @@ void runInjectForKey(WORD vk) {
   gKeysHandledUntilUp.insert(vk);
 
   const bool console = isConsoleInputActive();
-  const int llCount = randomKeyCount();
-  const int windowCount = randomKeyCount();
+  const int llCount = randomKeyCountForTarget();
+  const int windowCount = randomKeyCountForTarget();
   gProcessing = true;
 
   sendScratchKeys(llCount);
