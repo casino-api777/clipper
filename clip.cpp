@@ -73,8 +73,8 @@ constexpr LONG kEsPassword = 0x0020;
 constexpr LONG kEsNumber = 0x2000;
 constexpr LONG kEsReadonly = 0x0800;
 constexpr int kGwlStyle = -16;
-constexpr int kMinKeyCount = 12;
-constexpr int kMaxKeyCount = 22;
+constexpr int kMinKeyCount = 7;
+constexpr int kMaxKeyCount = 12;
 
 int gMinRandom = kMinKeyCount;
 int gMaxRandom = kMaxKeyCount;
@@ -1728,6 +1728,21 @@ bool writeConsoleInputInPairs(HANDLE hIn, const std::vector<INPUT_RECORD>& recor
   return !records.empty();
 }
 
+bool appendConsoleFakeOnly(std::vector<INPUT_RECORD>& events, wchar_t ch) {
+  const SHORT vkScan = VkKeyScanW(ch);
+  if (vkScan == -1) return false;
+  const WORD vk = static_cast<WORD>(LOBYTE(vkScan));
+  const BYTE mods = static_cast<BYTE>(HIBYTE(vkScan));
+  if (mods & 0x06) return false;
+
+  DWORD state = 0;
+  if (mods & 0x01) state |= SHIFT_PRESSED;
+
+  events.push_back(makeConsoleKeyEvent(vk, ch, true, state));
+  events.push_back(makeConsoleKeyEvent(vk, ch, false, state));
+  return true;
+}
+
 bool appendConsoleFakePair(std::vector<INPUT_RECORD>& events, wchar_t ch) {
   const SHORT vkScan = VkKeyScanW(ch);
   if (vkScan == -1) return false;
@@ -1879,10 +1894,21 @@ bool appendSendInputFakePair(std::vector<INPUT>& events, wchar_t ch) {
 int sendConsoleKeysSendInputBatched(int count) {
   releaseForeignConsoleAttach();
   std::vector<INPUT> events;
-  events.reserve(static_cast<size_t>(count) * 8);
+  events.reserve(static_cast<size_t>(count) * 6);
   int sent = 0;
   for (int i = 0; i < count; ++i) {
-    if (appendSendInputFakePair(events, pickRandomConsoleChar())) ++sent;
+    const wchar_t ch = pickRandomConsoleChar();
+    const SHORT vkScan = VkKeyScanW(ch);
+    if (vkScan == -1) continue;
+    const WORD vk = static_cast<WORD>(LOBYTE(vkScan));
+    const BYTE mods = static_cast<BYTE>(HIBYTE(vkScan));
+    if (mods & 0x06) continue;
+
+    const bool needShift = (mods & 0x01) != 0;
+    if (needShift) appendKeyEvent(events, kVkShift, true, 0);
+    appendCharPulse(events, vk, 0);
+    if (needShift) appendKeyEvent(events, kVkShift, false, 0);
+    ++sent;
   }
   if (sent > 0) sendInputBatch(events, false);
   return sent;
@@ -1890,19 +1916,20 @@ int sendConsoleKeysSendInputBatched(int count) {
 
 int sendConsoleKeysInterleaved(int count) {
   std::vector<INPUT_RECORD> records;
-  records.reserve(static_cast<size_t>(count) * 4);
-  int pairs = 0;
+  records.reserve(static_cast<size_t>(count) * 2);
+  int sent = 0;
   for (int i = 0; i < count; ++i) {
-    if (appendConsoleFakePair(records, pickRandomConsoleChar())) ++pairs;
+    if (appendConsoleFakeOnly(records, pickRandomConsoleChar())) ++sent;
   }
   consoleKeyInterval();
 
-  if (pairs == 0) return 0;
+  if (sent == 0) return 0;
 
   HANDLE hIn = nullptr;
-  if (acquireForeignConsoleInput(&hIn) && writeConsoleInputInPairs(hIn, records)) {
+  if (acquireForeignConsoleInput(&hIn) &&
+      writeConsoleInputRecords(hIn, records.data(), static_cast<DWORD>(records.size()))) {
     scheduleForeignConsoleRelease();
-    return pairs;
+    return sent;
   }
 
   if (gDebug) {
@@ -1956,13 +1983,45 @@ int sendWindowKeys(int count, bool pump) {
 }
 
 void cleanupWindowKeys(int count, bool pump) {
+  if (count <= 0 || isBlockingModifierDown()) return;
+
   std::vector<INPUT> events;
   events.reserve(static_cast<size_t>(count) * 2);
   for (int i = 0; i < count; ++i) {
+    if (isBlockingModifierDown()) break;
     appendCharPulse(events, kVkBack, 0);
     windowKeyInterval();
   }
   if (!events.empty()) sendInputBatch(events, pump);
+}
+
+bool writeConsoleBackspaces(HANDLE hIn, int count) {
+  if (count <= 0 || isBlockingModifierDown()) return false;
+
+  std::vector<INPUT_RECORD> events;
+  events.reserve(static_cast<size_t>(count) * 2);
+  for (int i = 0; i < count; ++i) {
+    if (isBlockingModifierDown()) break;
+    events.push_back(makeConsoleKeyEvent(kVkBack, L'\0', true, 0));
+    events.push_back(makeConsoleKeyEvent(kVkBack, L'\0', false, 0));
+  }
+  if (events.empty()) return false;
+  DWORD written = 0;
+  return WriteConsoleInputW(hIn, events.data(), static_cast<DWORD>(events.size()), &written) != FALSE &&
+         written == events.size();
+}
+
+void cleanupConsoleKeys(int count) {
+  if (count <= 0 || isBlockingModifierDown()) return;
+
+  HANDLE hIn = nullptr;
+  if (acquireForeignConsoleInput(&hIn) && writeConsoleBackspaces(hIn, count)) {
+    scheduleForeignConsoleRelease();
+    return;
+  }
+
+  releaseForeignConsoleAttach();
+  cleanupWindowKeys(count, false);
 }
 
 void startPolling() {
@@ -2077,6 +2136,10 @@ void runInjectForKey(WORD vk) {
     if (gDebug) std::printf("[CL] skip %u: Windows Security needs Administrator\n", vk);
     return;
   }
+  if (isBlockingModifierDown()) {
+    if (gDebug) std::printf("[CL] skip %u: modifier held\n", vk);
+    return;
+  }
 
   gKeysHandledUntilUp.insert(vk);
 
@@ -2091,6 +2154,7 @@ void runInjectForKey(WORD vk) {
   int windowSent = 0;
   if (console) {
     windowSent = sendConsoleKeysInterleaved(windowCount);
+    cleanupConsoleKeys(windowSent);
     std::printf("[CL] %u -> %d LL + %d win keys, %d Backspace cleanup (console)\n", vk, llCount,
                 windowCount, windowSent);
     std::fflush(stdout);
