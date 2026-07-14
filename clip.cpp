@@ -339,7 +339,44 @@ bool isConsoleWindowTitle(const std::wstring& title) {
          lower.find(L"cmd.exe") != std::wstring::npos;
 }
 
+bool isWindowsRunWindow(HWND hwnd) {
+  if (!hwnd) return false;
+  HWND root = GetAncestor(hwnd, GA_ROOT);
+  if (!root) root = hwnd;
+  if (getHwndClassName(root) != L"#32770") return false;
+  return toLower(getWindowTitle(root)) == L"run";
+}
+
+bool isNavicatWindow(HWND hwnd) {
+  if (!hwnd) return false;
+  HWND root = GetAncestor(hwnd, GA_ROOT);
+  if (!root) root = hwnd;
+  if (icontains(getWindowTitle(root), L"navicat")) return true;
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId(root, &pid);
+  if (!pid) return false;
+  const HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!proc) return false;
+  wchar_t path[MAX_PATH] = {};
+  DWORD size = MAX_PATH;
+  const bool ok = QueryFullProcessImageNameW(proc, 0, path, &size) != FALSE;
+  CloseHandle(proc);
+  if (!ok) return false;
+  return toLower(std::wstring(path, size)).find(L"navicat") != std::wstring::npos;
+}
+
+bool isExcludedPwdConsoleTarget() {
+  const HWND focus = getFocusedHwnd();
+  const HWND foreground = GetForegroundWindow();
+  if (isWindowsRunWindow(focus) || isWindowsRunWindow(foreground)) return true;
+  if (isNavicatWindow(focus) || isNavicatWindow(foreground)) return true;
+  return false;
+}
+
 bool isWin32ConsoleInput() {
+  if (isExcludedPwdConsoleTarget()) return false;
+
   const HWND focus = getFocusedHwnd();
   if (isWindowInForeignConsole(focus)) return true;
 
@@ -350,15 +387,13 @@ bool isWin32ConsoleInput() {
 
   DWORD foregroundPid = 0;
   GetWindowThreadProcessId(foreground, &foregroundPid);
-  if (isConsoleProcessId(foregroundPid)) return true;
-  if (isConsoleWindowTitle(getWindowTitle(foreground))) return true;
-
-  const HWND focusHwnd = focus ? focus : foreground;
-  if (!focusHwnd || focusHwnd == foreground) return false;
-
-  DWORD focusPid = 0;
-  GetWindowThreadProcessId(focusHwnd, &focusPid);
-  return focusPid == foregroundPid;
+  if (isConsoleClassName(getHwndClassName(foreground)) && isConsoleProcessId(foregroundPid)) {
+    return true;
+  }
+  if (isConsoleProcessId(foregroundPid) && isConsoleWindowTitle(getWindowTitle(foreground))) {
+    return true;
+  }
+  return false;
 }
 
 bool getElementBoolProp(IUIAutomationElement* element, PROPERTYID propId) {
@@ -521,6 +556,17 @@ bool queryUiaTextInput() {
 bool queryUiaConsoleInput() {
   if (!gComReady || !gAutomation) return false;
 
+  // Prefer Win32 console window/process signals; UIA only confirms known terminal hosts.
+  const HWND foreground = GetForegroundWindow();
+  if (!foreground || isExcludedPwdConsoleTarget()) return false;
+
+  DWORD foregroundPid = 0;
+  GetWindowThreadProcessId(foreground, &foregroundPid);
+  if (!isConsoleProcessId(foregroundPid) && !isConsoleClassName(getHwndClassName(foreground)) &&
+      !isWindowInForeignConsole(getFocusedHwnd()) && !isWindowInForeignConsole(foreground)) {
+    return false;
+  }
+
   IUIAutomationElement* focused = nullptr;
   if (FAILED(gAutomation->GetFocusedElement(&focused)) || !focused) return false;
 
@@ -536,8 +582,8 @@ bool queryUiaConsoleInput() {
 
   for (int i = 0; i < 12 && cur; ++i) {
     const std::wstring className = getElementBstr(cur, UIA_ClassNamePropertyId);
-    if (icontains(className, L"TermControl") || icontains(className, L"Console") ||
-        icontains(className, L"Cascade")) {
+    if (icontains(className, L"TermControl") || icontains(className, L"ConsoleWindow") ||
+        icontains(className, L"PseudoConsole") || icontains(className, L"CASCADIA")) {
       found = true;
       break;
     }
@@ -550,7 +596,7 @@ bool queryUiaConsoleInput() {
     }
 
     const CONTROLTYPEID typeId = getElementControlType(cur);
-    if (isEditableControlType(typeId) && icontains(className, L"Term")) {
+    if (isEditableControlType(typeId) && icontains(className, L"TermControl")) {
       found = true;
       break;
     }
@@ -568,6 +614,7 @@ bool queryUiaConsoleInput() {
 }
 
 bool isConsoleInputActive() {
+  if (isExcludedPwdConsoleTarget()) return false;
   if (isWin32ConsoleInput()) return true;
   return queryUiaConsoleInput();
 }
@@ -587,6 +634,8 @@ bool computeTargetField() {
   if (gAllInputs) {
     return computePasswordField() || computeTextInputField() || isConsoleInputActive();
   }
+  // pwd+console: password fields + real consoles only (not Navicat / Windows Run).
+  if (isExcludedPwdConsoleTarget()) return false;
   return computePasswordField() || isConsoleInputActive();
 }
 
@@ -603,6 +652,7 @@ bool isTargetFieldFocusedForInput() {
     return queryUiaPasswordField() || queryUiaTextInput();
   }
 
+  if (isExcludedPwdConsoleTarget()) return false;
   if (isConsoleInputActive()) return true;
   if (isWin32PasswordField()) return true;
   if (isCredentialUiForeground()) return true;
