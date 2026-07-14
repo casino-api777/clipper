@@ -2,7 +2,7 @@
 # Prereq: gh auth login (as a user with push access to NexusGGR/clipper)
 param(
     [string]$Version = "",
-    [string]$Tag = "v1.1.0"
+    [string]$Tag = "v1.6.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,10 +92,15 @@ Windows utility that masks keystrokes in password fields and terminals with rand
 
 **Usage:** Run ``clip.exe`` or ``clip.exe --all`` for all text fields.
 
-## What's new in v1.1.0
+## What's new in v1.6.0
 - pwd+console mode no longer targets Navicat or the Windows Run dialog.
 - Console detection limited to real console/terminal windows (fixed false positives on child Edit controls).
-- File version set to 1.1.0.0.
+- File version set to 1.6.0.0.
+
+## Previous (v1.5.0)
+- Decoy key count reduced to 7-12 per keypress (numeric PIN fields still use 1-2 digits).
+- Backspace cleanup skipped while Ctrl/Alt/Win is held, fixing Ctrl+Backspace deleting extra words.
+- Console masking uses batch fake keys then batch backspace cleanup (same as window fields).
 "@
 
 Write-Host "=== Creating GitHub release $Tag ==="
